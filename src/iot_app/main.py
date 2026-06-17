@@ -75,6 +75,10 @@ class SensorReading(BaseModel):
     created_at: str
 
 
+class SensorReadingListResponse(BaseModel):
+    items: List[SensorReading]
+
+
 class SensorReadingCreated(BaseModel):
     reading_id: str
     device_id: str
@@ -83,7 +87,7 @@ class SensorReadingCreated(BaseModel):
     created_at: str
 
 
-READINGS: List[Dict] = []
+READINGS: List[SensorReading] = []
 
 
 def build_problem(
@@ -94,38 +98,30 @@ def build_problem(
     instance: Optional[str] = None,
     problem_type: str = "about:blank",
 ) -> Dict:
-    problem = {
+    return {
         "type": problem_type,
         "title": title,
         "status": status_code,
         "detail": detail,
+        "instance": instance or "about:blank",
     }
-    if instance:
-        problem["instance"] = instance
-    return problem
 
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
     if isinstance(exc.detail, dict):
-        problem = exc.detail
+        content = exc.detail
     else:
-        problem = build_problem(
+        content = build_problem(
             status_code=exc.status_code,
             title=status.HTTP_STATUS_CODES.get(exc.status_code, "HTTP Error"),
             detail=str(exc.detail),
             instance=str(request.url.path),
         )
-
-    problem.setdefault("status", exc.status_code)
-    problem.setdefault("title", status.HTTP_STATUS_CODES.get(exc.status_code, "HTTP Error"))
-    problem.setdefault("type", "about:blank")
-    problem.setdefault("detail", "Request failed")
-    problem.setdefault("instance", str(request.url.path))
-
+    
     return JSONResponse(
         status_code=exc.status_code,
-        content=problem,
+        content=content,
         media_type="application/problem+json",
         headers=getattr(exc, "headers", None),
     )
@@ -153,7 +149,7 @@ async def validation_exception_handler(
     )
 
 
-def verify_bearer_token(authorization: Optional[str] = Header(default=None)) -> None:
+def verify_bearer_token(request: Request, authorization: Optional[str] = Header(default=None)) -> None:
     if not authorization:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -161,6 +157,7 @@ def verify_bearer_token(authorization: Optional[str] = Header(default=None)) -> 
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 title="Unauthorized",
                 detail="Missing Authorization header",
+                instance=str(request.url.path),
                 problem_type="https://smart-campus.local/problems/unauthorized",
             ),
         )
@@ -173,6 +170,7 @@ def verify_bearer_token(authorization: Optional[str] = Header(default=None)) -> 
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 title="Unauthorized",
                 detail="Invalid bearer token",
+                instance=str(request.url.path),
                 problem_type="https://smart-campus.local/problems/unauthorized",
             ),
         )
@@ -208,21 +206,21 @@ def health() -> HealthResponse:
     },
 )
 def create_reading(payload: SensorReadingCreate, response: Response) -> SensorReadingCreated:
-    if payload.metric == SensorMetric.temperature and payload.value >= 70:
+    if payload.metric == SensorMetric.temperature and payload.value >= 80:
         response.headers["X-Warning"] = "high-temperature"
 
     reading_id = next_reading_id()
     created_at = now_iso()
 
-    item = {
-        "reading_id": reading_id,
-        "device_id": payload.device_id,
-        "metric": payload.metric.value,
-        "value": payload.value,
-        "unit": payload.unit.value if payload.unit else None,
-        "timestamp": payload.timestamp,
-        "created_at": created_at,
-    }
+    item = SensorReading(
+        reading_id=reading_id,
+        device_id=payload.device_id,
+        metric=payload.metric,
+        value=payload.value,
+        unit=payload.unit,
+        timestamp=payload.timestamp,
+        created_at=created_at,
+    )
     READINGS.append(item)
 
     return SensorReadingCreated(
@@ -234,23 +232,23 @@ def create_reading(payload: SensorReadingCreate, response: Response) -> SensorRe
     )
 
 
-@app.get("/readings/latest", dependencies=[Depends(verify_bearer_token)])
+@app.get("/readings/latest", response_model=SensorReadingListResponse, dependencies=[Depends(verify_bearer_token)])
 def latest_readings(
     device_id: Optional[str] = Query(default=None),
     limit: int = Query(default=10, ge=1, le=100),
-) -> Dict[str, List[Dict]]:
+) -> SensorReadingListResponse:
     items = READINGS
 
     if device_id:
-        items = [item for item in items if item["device_id"] == device_id]
+        items = [item for item in items if item.device_id == device_id]
 
-    return {"items": items[-limit:]}
+    return SensorReadingListResponse(items=items[-limit:])
 
 
-@app.get("/readings/{reading_id}", dependencies=[Depends(verify_bearer_token)])
-def get_reading(reading_id: str) -> Dict:
+@app.get("/readings/{reading_id}", response_model=SensorReading, dependencies=[Depends(verify_bearer_token)])
+def get_reading(reading_id: str) -> SensorReading:
     for item in READINGS:
-        if item["reading_id"] == reading_id:
+        if item.reading_id == reading_id:
             return item
 
     raise HTTPException(
